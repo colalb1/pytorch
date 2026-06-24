@@ -97,7 +97,6 @@
 #include <ATen/ops/linalg_matrix_power_native.h>
 #include <ATen/ops/linalg_matrix_rank.h>
 #include <ATen/ops/linalg_matrix_rank_native.h>
-#include <ATen/ops/linalg_matrix_sqrt_native.h>
 #include <ATen/ops/linalg_multi_dot_native.h>
 #include <ATen/ops/linalg_norm.h>
 #include <ATen/ops/linalg_norm_native.h>
@@ -2806,49 +2805,6 @@ Tensor linalg_matrix_exp(const Tensor& a) {
 // Alias
 Tensor matrix_exp(const Tensor& a) {
   return at::linalg_matrix_exp(a);
-}
-
-// Principal square root of a symmetric/Hermitian positive-definite matrix.
-// Computed from the eigendecomposition A = Q diag(lambda) Q^H as
-// A^{1/2} = Q diag(sqrt(lambda)) Q^H. Only the lower triangle of `a` is read
-// (via linalg_eigh, UPLO="L"); `a` is assumed Hermitian. The custom backward in
-// FunctionsManual.cpp (linalg_matrix_sqrt_differential) uses the Daleckii-Krein
-// formula, whose denominator sqrt(lambda_i) + sqrt(lambda_j) stays well-defined
-// even at degenerate eigenvalues.
-Tensor linalg_matrix_sqrt(const Tensor& a) {
-  squareCheckInputs(a, "linalg.matrix_sqrt");
-  checkFloatingOrComplex(
-      a, "linalg.matrix_sqrt", /*allow_low_precision_dtypes=*/false);
-
-  NoTF32Guard disable_tf32;
-
-  if (a.sym_size(-1) == 0) {
-    return a.clone();
-  }
-  auto [eigvals, eigvecs] = at::linalg_eigh(a);
-  // The real square root of an indefinite matrix is complex, so reject a
-  // materially-negative spectrum. A genuinely PSD input may still show tiny
-  // negative eigenvalues from roundoff, bounded by the spectral scale; those
-  // pass this check and clamp_min below rounds them up to zero. The reduction
-  // forces one host-device sync per call (eigvals can be empty for a zero-sized
-  // batch, where there is nothing to validate).
-  if (eigvals.sym_numel() != 0) {
-    auto min_eigval = eigvals.min().item<double>();
-    auto max_abs_eigval = eigvals.abs().max().item<double>();
-    auto eps = eigvals.scalar_type() == at::kFloat
-        ? std::numeric_limits<float>::epsilon()
-        : std::numeric_limits<double>::epsilon();
-    auto tol = max_abs_eigval * eps * static_cast<double>(a.size(-1));
-    TORCH_CHECK(
-        min_eigval >= -tol,
-        "linalg.matrix_sqrt: A must be positive semi-definite, but its smallest "
-        "eigenvalue is ",
-        min_eigval);
-  }
-  auto sqrt_eigvals = eigvals.clamp_min(0).sqrt();
-  auto result = at::matmul(eigvecs * sqrt_eigvals.unsqueeze(-2), eigvecs.mH());
-  // The reconstruction is Hermitian up to roundoff; symmetrize to enforce it.
-  return 0.5 * (result + result.mH());
 }
 
 // TODO This should be deprecated in favor of linalg_matrix_exp_differential
