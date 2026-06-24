@@ -408,7 +408,7 @@ void apply_matrix_sqrt_real(const Tensor& T_work, const Tensor& vs, const Tensor
     }
     const scalar_t neg_tol = eps * scale * static_cast<scalar_t>(n);
 
-    // Diagonal blocks (and negative-eigenvalue detection); record the block layout.
+    // Diagonal blocks; detect negative real eigenvalues; record the block layout.
     std::vector<int64_t> starts;
     std::vector<int64_t> sizes;
     int64_t p = 0;
@@ -474,11 +474,9 @@ void apply_matrix_sqrt_real(const Tensor& T_work, const Tensor& vs, const Tensor
 #endif
 }
 
-// Type-dispatching helper for matrix_sqrt. The Schur factorization runs in
-// column-major working buffers; the back-transform X = Z U Z^H uses matmul.
 void matrix_sqrt_kernel(const Tensor& result, const Tensor& input, const Tensor& infos) {
   Tensor T_work = at::empty(input.mT().sizes(), input.options());
-  T_work.transpose_(-2, -1);  // Fortran-contiguous so gees overwrites it in place
+  T_work.transpose_(-2, -1);  // Fortran-contiguous layout for LAPACK
   T_work.copy_(input);
   Tensor vs = at::empty(input.mT().sizes(), input.options());
   vs.transpose_(-2, -1);
