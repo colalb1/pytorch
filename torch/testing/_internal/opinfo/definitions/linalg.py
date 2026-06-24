@@ -895,12 +895,15 @@ def sample_inputs_linalg_cholesky(
 def sample_inputs_linalg_matrix_sqrt(
     op_info, device, dtype, requires_grad=False, **kwargs
 ):
-    """Generates symmetric/Hermitian positive-definite inputs for torch.linalg.matrix_sqrt."""
-    from torch.testing._internal.common_utils import random_hermitian_pd_matrix
+    """General (non-symmetric) inputs with right-half-plane spectrum for matrix_sqrt."""
+    make_arg = partial(make_tensor, dtype=dtype, device=device)
 
     for batch, n in product([(), (0,), (2,), (1, 1)], [5, 0]):
-        a = random_hermitian_pd_matrix(n, *batch, dtype=dtype, device=device)
-        a.requires_grad = requires_grad
+        # low/high (not a float multiply) preserves integer dtypes for test_dtypes.
+        a = make_arg((*batch, n, n), low=-0.3, high=0.3)
+        if n > 0:
+            a = a + 3 * torch.eye(n, dtype=dtype, device=device)
+        a.requires_grad_(requires_grad)
         yield SampleInput(a)
 
 
@@ -1230,15 +1233,16 @@ op_db: list[OpInfo] = [
         aten_name="linalg_matrix_sqrt",
         dtypes=floating_and_complex_types(),
         sample_inputs_func=sample_inputs_linalg_matrix_sqrt,
-        gradcheck_wrapper=gradcheck_wrapper_hermitian_input,
         check_batched_grad=False,
         check_batched_gradgrad=False,
         check_batched_forward_grad=False,
         supports_forward_ad=True,
-        supports_fwgrad_bwgrad=True,
+        # First order only (Decision E1); no second-order derivatives.
+        supports_fwgrad_bwgrad=False,
+        supports_gradgrad=False,
         # autogen .out exists but is not exercised here (mirrors linalg.matrix_exp).
         supports_out=False,
-        decorators=[skipCUDAIfNoMagma, skipCPUIfNoLapack, with_tf32_off],
+        decorators=[skipCPUIfNoLapack, with_tf32_off],
         skips=(
             # The operator 'aten::linalg_matrix_sqrt' is not implemented for MPS.
             DecorateInfo(unittest.expectedFailure, "TestCommon", device_type="mps"),
