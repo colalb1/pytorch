@@ -2220,34 +2220,44 @@ matrix_sqrt = _add_docstr(
     r"""
 linalg.matrix_sqrt(A) -> Tensor
 
-Computes the principal square root of a symmetric (resp. Hermitian) positive-definite matrix.
+Computes the principal square root of a square matrix.
 
 Letting :math:`\mathbb{K}` be :math:`\mathbb{R}` or :math:`\mathbb{C}`,
-for a symmetric (resp. Hermitian) positive-definite matrix :math:`A \in \mathbb{K}^{n \times n}`,
-this function returns the unique symmetric (resp. Hermitian) positive-definite matrix
-:math:`X \in \mathbb{K}^{n \times n}` such that
+for a matrix :math:`A \in \mathbb{K}^{n \times n}` with no eigenvalue on the closed
+negative real axis, this function returns the unique matrix
+:math:`X \in \mathbb{K}^{n \times n}` whose eigenvalues lie in the open right
+half-plane and such that
 
 .. math::
     XX = A.
 
-The result is computed from the eigendecomposition :math:`A = Q \operatorname{diag}(\lambda) Q^H`
-as :math:`X = Q \operatorname{diag}(\sqrt{\lambda}) Q^H`.
+The result is computed by the Schur method (Bjorck-Hammarling): :math:`A` is
+reduced to (quasi-)triangular Schur form, the square root of the triangular factor
+is found by a recurrence, and the factorization is undone. This handles general
+(non-normal, non-symmetric) matrices, not only positive-definite ones.
 
 Supports input of float, double, cfloat and cdouble dtypes.
 Also supports batches of matrices, and if :attr:`A` is a batch of matrices then
 the output has the same batch dimensions.
 
-.. note:: Only the lower triangular part of :attr:`A` is used in the computation, and
-          :attr:`A` is assumed to be symmetric (resp. Hermitian). See :func:`torch.linalg.eigh`.
+.. note:: For a real :attr:`A` the result is real. A real matrix has a real square
+          root only if it has no negative real eigenvalue; this function raises a
+          runtime error when :attr:`A` has a negative real eigenvalue. For a complex
+          :attr:`A` the result is complex.
 
-.. note:: :attr:`A` must be positive semi-definite. The real square root of a matrix with
-          a negative eigenvalue is complex, so this function raises a runtime error when
-          :attr:`A` has a materially negative eigenvalue.
+.. note:: The conditioning of the problem grows with the non-normality of :attr:`A`
+          and as its eigenvalues approach the negative real axis (the branch cut).
+          The square root of a singular matrix with a defective zero eigenvalue may
+          not exist; the result can then contain ``NaN`` values.
 
-.. note:: The first-order gradient is numerically stable even when :attr:`A` has repeated
-          eigenvalues, unlike differentiating through :func:`torch.linalg.eigh`, but requires
-          :attr:`A` to be positive-definite. Higher-order derivatives differentiate through
-          :func:`torch.linalg.eigh` and are not stable at repeated eigenvalues.
+.. note:: This function is implemented on the CPU using LAPACK. Inputs on other
+          devices are copied to the CPU for the computation and the result is copied
+          back, which incurs a host-device synchronization.
+
+.. note:: The first-order gradient is computed from the Frechet derivative of the
+          square root (a Sylvester equation) and is numerically stable for the
+          principal root, including at repeated eigenvalues, unlike differentiating
+          through :func:`torch.linalg.eig`. Higher-order derivatives are not supported.
 
 .. seealso::
 
@@ -2256,17 +2266,21 @@ the output has the same batch dimensions.
 
 Args:
     A (Tensor): tensor of shape `(*, n, n)` where `*` is zero or more batch dimensions
-                consisting of symmetric (resp. Hermitian) positive-definite matrices.
+                consisting of square matrices with no negative real eigenvalue (real
+                inputs) or no eigenvalue on the closed negative real axis.
 
 Examples::
 
-    >>> A = torch.tensor([[2., 0.], [0., 9.]])
-    >>> torch.linalg.matrix_sqrt(A)
-    tensor([[1.4142, 0.0000],
-            [0.0000, 3.0000]])
+    >>> A = torch.tensor([[2., 1.], [0., 3.]])
+    >>> X = torch.linalg.matrix_sqrt(A)
+    >>> X
+    tensor([[1.4142, 0.3178],
+            [0.0000, 1.7321]])
+    >>> torch.allclose(X @ X, A, atol=1e-6)
+    True
 
     >>> A = torch.randn(2, 3, 3)
-    >>> A = A @ A.mT + 3 * torch.eye(3)  # batch of symmetric positive-definite matrices
+    >>> A = A + 3 * torch.eye(3)  # batch of matrices with right-half-plane spectrum
     >>> X = torch.linalg.matrix_sqrt(A)
     >>> torch.allclose(X @ X, A, atol=1e-5)
     True
