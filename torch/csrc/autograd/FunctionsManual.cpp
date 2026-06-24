@@ -4327,28 +4327,24 @@ Tensor linalg_matrix_exp_differential(
       self, grad, at::linalg_matrix_exp, /* adjoint */ adjoint);
 }
 
-// Differential of the symmetric/Hermitian matrix square root, used for both
-// reverse-mode (grad = cotangent) and forward-mode (grad = input tangent).
-// For A = Q diag(lambda) Q^H the Daleckii-Krein/Loewner derivative is
-// T(E) = Q (W o (Q^H sym(E) Q)) Q^H with W_ij = 1 / (sqrt(l_i) + sqrt(l_j)),
-// which for f = sqrt needs no separate diagonal case and no divided-difference
-// cancellation handling. W is real symmetric and Q unitary, so T is
-// self-adjoint w.r.t. the real trace inner product; hence the same operator
-// serves the VJP and the JVP. Requires positive-definite input (the denominator
-// vanishes at a zero eigenvalue).
-Tensor linalg_matrix_sqrt_differential(const Tensor& self, const Tensor& grad) {
+// Frechet derivative of sqrtm via the block 2x2 trick: the top-right block of
+// sqrtm([[M, E], [0, M]]) is D sqrtm(M)[E]. Forward mode uses M = A; reverse mode
+// uses M = A^H (the adjoint of the Frechet derivative). First order only.
+Tensor linalg_matrix_sqrt_differential(
+    const Tensor& self,
+    const Tensor& grad,
+    bool adjoint) {
   if (!grad.defined()) {
     return {};
   }
-  at::NoTF32Guard disable_tf32;
-  auto [eigvals, eigvecs] = at::linalg_eigh(self);
-  auto sqrt_eigvals = eigvals.clamp_min(0).sqrt();
-  auto denom = sqrt_eigvals.unsqueeze(-1) + sqrt_eigvals.unsqueeze(-2);
-  auto grad_sym = 0.5 * (grad + grad.mH());
-  auto inner =
-      at::matmul(at::matmul(eigvecs.mH(), grad_sym), eigvecs).div(denom);
-  auto out = at::matmul(at::matmul(eigvecs, inner), eigvecs.mH());
-  return 0.5 * (out + out.mH());
+  const auto M = adjoint ? self.mH() : self;
+  const auto n = M.sym_size(-1);
+  auto zero = at::zeros_like(M);
+  auto top = at::cat({M, grad}, -1);
+  auto bot = at::cat({zero, M}, -1);
+  auto block = at::cat({top, bot}, -2);
+  auto root = at::linalg_matrix_sqrt(block);
+  return root.narrow_symint(-2, 0, n).narrow_symint(-1, n, n);
 }
 
 template <typename F1, typename F2, typename... Ts>
