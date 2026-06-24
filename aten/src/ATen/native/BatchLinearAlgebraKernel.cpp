@@ -10,12 +10,18 @@
 
 #include <c10/util/irange.h>
 
+#include <array>
+#include <complex>
+#include <limits>
+#include <vector>
+
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_strided.h>
+#include <ATen/ops/matmul.h>
 #include <ATen/ops/zeros.h>
 
 #include <algorithm>
@@ -283,6 +289,213 @@ void linalg_eig_kernel(Tensor& eigenvalues, Tensor& eigenvectors, Tensor& infos,
   AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES(input.scalar_type(), "linalg_eig_out_cpu", [&]{
     apply_linalg_eig<scalar_t>(eigenvalues, eigenvectors, input_working_copy, infos, compute_eigenvectors);
   });
+}
+
+// Triangular square root of the complex Schur factor by the Bjorck-Hammarling
+// scalar recurrence. gees overwrites T_work with the Schur form and writes the
+// Schur vectors into vs; U receives the upper-triangular square root (U U = T).
+// The caller forms X = Z U Z^H.
+template <typename scalar_t>
+void apply_matrix_sqrt_complex(const Tensor& T_work, const Tensor& vs, const Tensor& U, const Tensor& infos) {
+#if !AT_BUILD_WITH_LAPACK()
+  TORCH_CHECK(false, "Calling torch.linalg.matrix_sqrt on a CPU tensor requires compiling ",
+    "PyTorch with LAPACK. Please use PyTorch built with LAPACK support.");
+#else
+  using value_t = typename c10::scalar_value_type<scalar_t>::type;
+  auto n = T_work.size(-1);
+  auto lda = std::max<int64_t>(1, n);
+  auto batch_size = batchCount(T_work);
+  auto stride = matrixStride(T_work);
+  auto* T_data = T_work.data_ptr<scalar_t>();
+  auto* vs_data = vs.data_ptr<scalar_t>();
+  auto* U_data = U.data_ptr<scalar_t>();
+  auto* infos_data = infos.data_ptr<int>();
+
+  Tensor w = at::empty({n}, T_work.options());
+  auto* w_data = w.data_ptr<scalar_t>();
+  Tensor rwork = at::empty({n}, T_work.options().dtype(toRealValueType(T_work.scalar_type())));
+  auto* rwork_data = rwork.data_ptr<value_t>();
+  int sdim = 0;
+
+  scalar_t work_query;
+  int info_query = 0;
+  lapackSchur<scalar_t, value_t>(n, T_data, lda, &sdim, w_data, vs_data, lda, &work_query, -1, rwork_data, &info_query);
+  int lwork = lapack_work_to_int(work_query);
+  Tensor work = at::empty({lwork}, T_work.options());
+  auto* work_data = work.data_ptr<scalar_t>();
+
+  auto csqrt = [](scalar_t z) {
+    return scalar_t(std::sqrt(static_cast<std::complex<value_t>>(z)));
+  };
+
+  for (const auto b : c10::irange(batch_size)) {
+    scalar_t* T = &T_data[b * stride];
+    scalar_t* Z = &vs_data[b * stride];
+    scalar_t* Um = &U_data[b * stride];
+    int info = 0;
+    lapackSchur<scalar_t, value_t>(n, T, lda, &sdim, w_data, Z, lda, work_data, lwork, rwork_data, &info);
+    infos_data[b] = info;
+    if (info != 0) {
+      continue;
+    }
+    for (const auto i : c10::irange(n)) {
+      Um[i + i * lda] = csqrt(T[i + i * lda]);
+    }
+    for (const auto j : c10::irange(n)) {
+      for (int64_t i = j - 1; i >= 0; --i) {
+        scalar_t s = T[i + j * lda];
+        for (const auto k : c10::irange(i + 1, j)) {
+          s -= Um[i + k * lda] * Um[k + j * lda];
+        }
+        Um[i + j * lda] = s / (Um[i + i * lda] + Um[j + j * lda]);
+      }
+    }
+  }
+#endif
+}
+
+// Real Schur square root: T is upper quasi-triangular (2x2 blocks for complex
+// eigenpairs). Diagonal blocks use a scalar sqrt or the Cayley-Hamilton 2x2 sqrt
+// X = (B + sqrt(det B) I) / sqrt(tr B + 2 sqrt(det B)); off-diagonal blocks solve
+// a Sylvester equation with trsyl. A negative 1x1 block is a negative real
+// eigenvalue (no real square root) and raises.
+template <typename scalar_t>
+void apply_matrix_sqrt_real(const Tensor& T_work, const Tensor& vs, const Tensor& U, const Tensor& infos) {
+#if !AT_BUILD_WITH_LAPACK()
+  TORCH_CHECK(false, "Calling torch.linalg.matrix_sqrt on a CPU tensor requires compiling ",
+    "PyTorch with LAPACK. Please use PyTorch built with LAPACK support.");
+#else
+  auto n = T_work.size(-1);
+  auto lda = std::max<int64_t>(1, n);
+  auto batch_size = batchCount(T_work);
+  auto stride = matrixStride(T_work);
+  auto* T_data = T_work.data_ptr<scalar_t>();
+  auto* vs_data = vs.data_ptr<scalar_t>();
+  auto* U_data = U.data_ptr<scalar_t>();
+  auto* infos_data = infos.data_ptr<int>();
+
+  Tensor w = at::empty({2 * n}, T_work.options());
+  auto* w_data = w.data_ptr<scalar_t>();
+  scalar_t* rwork_data = nullptr;
+  int sdim = 0;
+
+  scalar_t work_query;
+  int info_query = 0;
+  lapackSchur<scalar_t>(n, T_data, lda, &sdim, w_data, vs_data, lda, &work_query, -1, rwork_data, &info_query);
+  int lwork = lapack_work_to_int(work_query);
+  Tensor work = at::empty({lwork}, T_work.options());
+  auto* work_data = work.data_ptr<scalar_t>();
+
+  const scalar_t eps = std::numeric_limits<scalar_t>::epsilon();
+
+  for (const auto b : c10::irange(batch_size)) {
+    scalar_t* T = &T_data[b * stride];
+    scalar_t* Z = &vs_data[b * stride];
+    scalar_t* Um = &U_data[b * stride];
+    int info = 0;
+    lapackSchur<scalar_t>(n, T, lda, &sdim, w_data, Z, lda, work_data, lwork, rwork_data, &info);
+    infos_data[b] = info;
+    if (info != 0) {
+      continue;
+    }
+
+    auto Tij = [&](int64_t i, int64_t j) -> scalar_t& { return T[i + j * lda]; };
+    auto Uij = [&](int64_t i, int64_t j) -> scalar_t& { return Um[i + j * lda]; };
+
+    scalar_t scale = scalar_t(1);
+    for (const auto i : c10::irange(n)) {
+      scale = std::max(scale, std::abs(Tij(i, i)));
+    }
+    const scalar_t neg_tol = eps * scale * static_cast<scalar_t>(n);
+
+    // Diagonal blocks (and negative-eigenvalue detection); record the block layout.
+    std::vector<int64_t> starts;
+    std::vector<int64_t> sizes;
+    int64_t p = 0;
+    while (p < n) {
+      bool two_by_two = (p < n - 1) &&
+          std::abs(Tij(p + 1, p)) > eps * (std::abs(Tij(p, p)) + std::abs(Tij(p + 1, p + 1)));
+      if (two_by_two) {
+        scalar_t a = Tij(p, p), b01 = Tij(p, p + 1), b10 = Tij(p + 1, p), d = Tij(p + 1, p + 1);
+        scalar_t sd = std::sqrt(a * d - b01 * b10);  // det > 0 for a complex-eigenvalue block
+        scalar_t ss = std::sqrt(a + d + scalar_t(2) * sd);
+        Uij(p, p) = (a + sd) / ss;
+        Uij(p, p + 1) = b01 / ss;
+        Uij(p + 1, p) = b10 / ss;
+        Uij(p + 1, p + 1) = (d + sd) / ss;
+        starts.push_back(p);
+        sizes.push_back(2);
+        p += 2;
+      } else {
+        TORCH_CHECK(Tij(p, p) >= -neg_tol,
+            "linalg.matrix_sqrt: input has a negative real eigenvalue (", Tij(p, p),
+            "); a real matrix with a negative real eigenvalue has no real square root.");
+        Uij(p, p) = std::sqrt(std::max(Tij(p, p), scalar_t(0)));
+        starts.push_back(p);
+        sizes.push_back(1);
+        p += 1;
+      }
+    }
+
+    // Off-diagonal blocks, by block-column then bottom-up rows.
+    int64_t nb = static_cast<int64_t>(starts.size());
+    for (const auto jb : c10::irange(nb)) {
+      int64_t js = starts[jb], jsz = sizes[jb];
+      for (int64_t ib = jb - 1; ib >= 0; --ib) {
+        int64_t is = starts[ib], isz = sizes[ib];
+        std::array<scalar_t, 4> S{};
+        for (const auto bcol : c10::irange(jsz)) {
+          for (const auto arow : c10::irange(isz)) {
+            scalar_t s = Tij(is + arow, js + bcol);
+            for (const auto cc : c10::irange(is + isz, js)) {
+              s -= Uij(is + arow, cc) * Uij(cc, js + bcol);
+            }
+            S[arow + bcol * isz] = s;
+          }
+        }
+        if (isz == 1 && jsz == 1) {
+          Uij(is, js) = S[0] / (Uij(is, is) + Uij(js, js));
+        } else {
+          scalar_t scale_out = scalar_t(1);
+          int info_syl = 0;
+          lapackSylvester<scalar_t>('N', 'N', 1, static_cast<int>(isz), static_cast<int>(jsz),
+              &Um[is + is * lda], static_cast<int>(lda),
+              &Um[js + js * lda], static_cast<int>(lda),
+              S.data(), static_cast<int>(isz), &scale_out, &info_syl);
+          for (const auto bcol : c10::irange(jsz)) {
+            for (const auto arow : c10::irange(isz)) {
+              Uij(is + arow, js + bcol) = S[arow + bcol * isz] / scale_out;
+            }
+          }
+        }
+      }
+    }
+  }
+#endif
+}
+
+// Type-dispatching helper for matrix_sqrt. The Schur factorization runs in
+// column-major working buffers; the back-transform X = Z U Z^H uses matmul.
+void matrix_sqrt_kernel(const Tensor& result, const Tensor& input, const Tensor& infos) {
+  Tensor T_work = at::empty(input.mT().sizes(), input.options());
+  T_work.transpose_(-2, -1);  // Fortran-contiguous so gees overwrites it in place
+  T_work.copy_(input);
+  Tensor vs = at::empty(input.mT().sizes(), input.options());
+  vs.transpose_(-2, -1);
+  Tensor U = at::zeros(input.mT().sizes(), input.options());
+  U.transpose_(-2, -1);
+
+  if (input.is_complex()) {
+    AT_DISPATCH_COMPLEX_TYPES(input.scalar_type(), "matrix_sqrt_cpu", [&] {
+      apply_matrix_sqrt_complex<scalar_t>(T_work, vs, U, infos);
+    });
+  } else {
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "matrix_sqrt_cpu", [&] {
+      apply_matrix_sqrt_real<scalar_t>(T_work, vs, U, infos);
+    });
+  }
+
+  result.copy_(at::matmul(at::matmul(vs, U), vs.mH()));
 }
 
 /*
@@ -1229,6 +1442,7 @@ REGISTER_ALL_CPU_DISPATCH(cholesky_stub, &cholesky_kernel)
 REGISTER_ALL_CPU_DISPATCH(cholesky_inverse_stub, &cholesky_inverse_kernel_impl)
 REGISTER_ALL_CPU_DISPATCH(linalg_eig_make_complex_eigenvectors_stub, &linalg_eig_make_complex_eigenvectors_cpu)
 REGISTER_ALL_CPU_DISPATCH(linalg_eig_stub, &linalg_eig_kernel)
+REGISTER_ALL_CPU_DISPATCH(matrix_sqrt_stub, &matrix_sqrt_kernel)
 REGISTER_ALL_CPU_DISPATCH(linalg_eigh_stub, &linalg_eigh_kernel)
 REGISTER_ALL_CPU_DISPATCH(geqrf_stub, &geqrf_kernel)
 REGISTER_ALL_CPU_DISPATCH(orgqr_stub, &orgqr_kernel_impl)
