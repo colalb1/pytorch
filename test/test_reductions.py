@@ -26,7 +26,8 @@ from torch.testing._internal.common_utils import (
     IS_WINDOWS)
 from torch.testing._internal.common_device_type import (
     OpDTypes, expectedFailureMeta, instantiate_device_type_tests, onlyCPU, dtypes, dtypesIfCUDA,
-    dtypesIfCPU, dtypesIfMPS, dtypesIfXPU, onlyNativeDeviceTypes, onlyCUDA, onlyOn, largeTensorTest, ops, precisionOverride)
+    dtypesIfCPU, dtypesIfMPS, dtypesIfXPU, onlyNativeDeviceTypes, onlyCUDA, onlyOn, largeTensorTest, ops,
+    precisionOverride, skipMeta, skipMPS, skipXPU)
 from torch.testing._internal.common_methods_invocations import (
     ReductionOpInfo, ReductionPythonRefInfo, reduction_ops, reference_masked_ops)
 
@@ -3426,7 +3427,12 @@ class TestReductions(TestCase):
         eq_func(hist_out, expected_hist)
         eq_func(bin_edges_out, expected_bin_edges)
 
-    @onlyCPU
+    # CPU and CUDA only: the MPS/XPU histogram backends have preexisting quirks
+    # (e.g. different unsupported-dtype messages and numeric differences) that
+    # are out of scope here.
+    @skipMeta
+    @skipMPS
+    @skipXPU
     @dtypes(torch.float32)
     def test_histogram(self, device, dtype):
         shapes = (
@@ -3505,7 +3511,7 @@ class TestReductions(TestCase):
     """
     def _test_histogramdd_numpy(self, t, bins, bin_range, weights, density):
         def to_np(t):
-            if type(t) is list:
+            if isinstance(t, (list, tuple)):
                 return list(map(to_np, t))
             if not torch.is_tensor(t):
                 return t
@@ -3558,7 +3564,9 @@ class TestReductions(TestCase):
         for dim in range(D):
             self.assertEqual(actual_bin_edges[dim], expected_bin_edges[dim])
 
-    @onlyCPU
+    @skipMeta
+    @skipMPS
+    @skipXPU
     @dtypes(torch.float32)
     def test_histogramdd(self, device, dtype):
         shapes = (
@@ -3616,7 +3624,9 @@ class TestReductions(TestCase):
                 self.assertEqual(bin_edges[dim].is_contiguous(), bins_contig)
             self._test_histogramdd_numpy(values, bin_edges, None, weights, density)
 
-    @onlyCPU
+    @skipMeta
+    @skipMPS
+    @skipXPU
     @dtypes(torch.float32)
     def test_histogram_error_handling(self, device, dtype):
         with self.assertRaisesRegex(RuntimeError, 'not implemented for'):
@@ -3677,6 +3687,124 @@ as the input tensor excluding its innermost dimension'):
         with self.assertRaisesRegex(RuntimeError, r'range \[nan, nan\] is not finite'):
             values = torch.tensor([float("nan")], device=device, dtype=dtype)
             torch.histogram(values, 2)
+
+    def _assert_histogram_matches_cpu(self, values, bins, bin_range, weights, density,
+                                      eq_func=None):
+        if eq_func is None:
+            eq_func = self.assertEqual
+        cpu_values = values.cpu()
+        cpu_weights = weights.cpu() if weights is not None else None
+        if torch.is_tensor(bins):
+            actual = torch.histogram(values, bins, weight=weights, density=density)
+            expected = torch.histogram(cpu_values, bins.cpu(), weight=cpu_weights, density=density)
+        else:
+            actual = torch.histogram(values, bins, range=bin_range, weight=weights, density=density)
+            expected = torch.histogram(cpu_values, bins, range=bin_range, weight=cpu_weights, density=density)
+        eq_func(actual[0].cpu(), expected[0], equal_nan=True)
+        eq_func(actual[1].cpu(), expected[1], equal_nan=True)
+
+    # The binning of the CUDA kernels is bit-for-bit identical to the CPU kernels;
+    # only the (atomic) accumulation order differs, which is exact for integer
+    # counts. half/bfloat16 are exercised here through explicit bin edges (whose
+    # values are shared across devices) and integer-valued weights so that the
+    # low-precision accumulation stays order-independent.
+    @onlyCUDA
+    @dtypes(torch.float32, torch.float64, torch.float16, torch.bfloat16)
+    def test_histogram_cuda_consistency(self, device, dtype):
+        low_precision = dtype in (torch.float16, torch.bfloat16)
+        shapes = ((), (1,), (64,), (1, 5), (3, 5), (2, 3, 5))
+
+        for shape, bin_ct, weighted, density in product(shapes, (1, 4, 17), [False, True], [False, True]):
+            values = make_tensor(shape, dtype=dtype, device=device, low=-9, high=9)
+            if weighted:
+                weights = make_tensor(shape, dtype=dtype, device=device, low=0, high=5)
+                if low_precision:
+                    weights = weights.round()
+            else:
+                weights = None
+
+            bin_edges = make_tensor(bin_ct + 1, dtype=dtype, device=device, low=-9, high=9).msort()
+            self._assert_histogram_matches_cpu(values, bin_edges, None, weights, density)
+
+            if not low_precision:
+                # Integer bin counts go through linspace and outer-edge selection,
+                # which match the CPU path only for float/double.
+                self._assert_histogram_matches_cpu(values, bin_ct, None, weights, density)
+                bin_range = (-7.0, 6.0)
+                self._assert_histogram_matches_cpu(values, bin_ct, bin_range, weights, density)
+
+    @onlyCUDA
+    @dtypes(torch.float32, torch.float64)
+    def test_histogram_cuda_edge_cases(self, device, dtype):
+        compare = partial(self._assert_histogram_matches_cpu)
+
+        # Empty input
+        compare(torch.tensor([], dtype=dtype, device=device), 4, (0., 1.), None, False)
+        # Single element
+        compare(torch.tensor([0.5], dtype=dtype, device=device), 4, (0., 1.), None, True)
+        # All-equal elements (min == max triggers range expansion)
+        compare(torch.full((37,), 3.0, dtype=dtype, device=device), 5, None, None, False)
+        # Out-of-range values are dropped
+        compare(torch.tensor([-5., 0.2, 0.7, 5.], dtype=dtype, device=device), 4, (0., 1.), None, False)
+        # NaN and +/-inf are dropped (explicit range avoids outer-edge selection on non-finite input)
+        non_finite = torch.tensor([float('nan'), float('inf'), float('-inf'), 0.3, 0.6, 0.6],
+                                  dtype=dtype, device=device)
+        compare(non_finite, 4, (0., 1.), None, False)
+        # Negative weights, including the density normalization
+        values = torch.tensor([0.1, 0.2, 0.8, 0.9], dtype=dtype, device=device)
+        weights = torch.tensor([-1., 2., -3., 4.], dtype=dtype, device=device)
+        compare(values, 4, (0., 1.), weights, False)
+        compare(values, 4, (0., 1.), weights, True)
+        # Explicit non-uniform bin edges
+        edges = torch.tensor([0., 0.25, 0.5, 1.0], dtype=dtype, device=device)
+        compare(values, edges, None, weights, False)
+
+    # Exercises both accumulation paths: tiny bin counts cause high atomic
+    # contention (SHARED), while a bin count whose histogram exceeds shared
+    # memory forces the GLOBAL path.
+    @onlyCUDA
+    @dtypes(torch.float32)
+    def test_histogram_cuda_memory_paths(self, device, dtype):
+        values = make_tensor((100000,), dtype=dtype, device=device, low=-100, high=100)
+        for bin_ct in (1, 2, 64, 100000):
+            actual_hist, actual_edges = torch.histogram(values, bin_ct, range=(-100., 100.))
+            expected_hist, expected_edges = torch.histogram(values.cpu(), bin_ct, range=(-100., 100.))
+            self.assertEqual(actual_hist.cpu(), expected_hist)
+            self.assertEqual(actual_edges.cpu(), expected_edges)
+
+    @onlyCUDA
+    @dtypes(torch.float32, torch.float64, torch.float16, torch.bfloat16)
+    def test_histogramdd_cuda_consistency(self, device, dtype):
+        low_precision = dtype in (torch.float16, torch.bfloat16)
+        # (10, 10, 10) with several bins per dim forces the GLOBAL accumulation path.
+        shapes = ((3, 2), (5, 3), (2, 4, 3), (10, 10, 10))
+
+        for shape, weighted, density in product(shapes, [False, True], [False, True]):
+            D = shape[-1]
+            values = make_tensor(shape, dtype=dtype, device=device, low=-9, high=9)
+            if weighted:
+                weights = make_tensor(shape[:-1], dtype=dtype, device=device, low=0, high=5)
+                if low_precision:
+                    weights = weights.round()
+            else:
+                weights = None
+            bin_ct = [random.randint(1, 4) for _ in range(D)]
+
+            cpu_weights = weights.cpu() if weights is not None else None
+            edges = [make_tensor(ct + 1, dtype=dtype, device=device, low=-9, high=9).msort() for ct in bin_ct]
+            actual = torch.histogramdd(values, edges, weight=weights, density=density)
+            expected = torch.histogramdd(values.cpu(), [e.cpu() for e in edges],
+                                         weight=cpu_weights, density=density)
+            self.assertEqual(actual[0].cpu(), expected[0])
+            for actual_edge, expected_edge in zip(actual[1], expected[1]):
+                self.assertEqual(actual_edge.cpu(), expected_edge)
+
+            if not low_precision:
+                actual = torch.histogramdd(values, bin_ct, weight=weights, density=density)
+                expected = torch.histogramdd(values.cpu(), bin_ct, weight=cpu_weights, density=density)
+                self.assertEqual(actual[0].cpu(), expected[0])
+                for actual_edge, expected_edge in zip(actual[1], expected[1]):
+                    self.assertEqual(actual_edge.cpu(), expected_edge)
 
     # Tests to ensure that reduction functions employing comparison operators are usable when there
     # exists a zero dimension (i.e. when the tensors are empty) in the tensor. These tests specifically
