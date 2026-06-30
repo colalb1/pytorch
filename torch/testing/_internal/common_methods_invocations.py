@@ -21396,7 +21396,10 @@ op_db: list[OpInfo] = [
                     supports_rhs_python_scalar=False),
     OpInfo('histogram',
            dtypes=floating_types(),
-           dtypesIfCUDA=_dispatch_dtypes(),  # histogram is only implemented on CPU
+           # int bin counts go through outer-edge selection, which (matching the
+           # CPU kernel) only dispatches float/double; half/bfloat16 are exercised
+           # with explicit ranges/edges in test_reductions.py.
+           dtypesIfCUDA=floating_types(),
            sample_inputs_func=sample_inputs_histogram,
            supports_autograd=False,
            skips=(
@@ -21414,13 +21417,11 @@ op_db: list[OpInfo] = [
            )),
     OpInfo('histogramdd',
            dtypes=floating_types(),
-           dtypesIfCUDA=_dispatch_dtypes(),  # histogramdd is only implemented on CPU
+           dtypesIfCUDA=floating_types(),
            sample_inputs_func=sample_inputs_histogramdd,
            error_inputs_func=error_inputs_histogramdd,
            supports_autograd=False,
            skips=(
-               # Not implemented on CUDA
-               DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_errors', device_type='cuda'),
                # JIT tests don't work with Tensor keyword arguments
                # https://github.com/pytorch/pytorch/issues/58507
                DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit'),
