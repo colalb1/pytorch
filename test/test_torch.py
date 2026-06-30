@@ -1795,6 +1795,24 @@ class TestTorchDeviceType(TestCase):
                 '_histc_cuda with floating point input',
                 torch.device(device).type == 'cuda' and dtype.is_floating_point)
 
+    @dtypes(torch.float32)
+    def test_nondeterministic_alert_histogram(self, device, dtype):
+        a = torch.tensor([1., 2., 3.], device=device, dtype=dtype)
+        bins = torch.tensor([0., 1., 2., 3.], device=device, dtype=dtype)
+        for op_call in [torch.histogram, torch.Tensor.histogram]:
+            self.check_nondeterministic_alert(
+                lambda: op_call(a, bins),
+                'histogramdd_cuda',
+                torch.device(device).type == 'cuda')
+
+    @dtypes(torch.float32)
+    def test_nondeterministic_alert_histogramdd(self, device, dtype):
+        a = torch.tensor([[1., 2.], [3., 4.]], device=device, dtype=dtype)
+        self.check_nondeterministic_alert(
+            lambda: torch.histogramdd(a, bins=3),
+            'histogramdd_cuda',
+            torch.device(device).type == 'cuda')
+
     def test_nondeterministic_alert_bincount(self, device):
         a = torch.tensor([], device=device, dtype=torch.long)
         weights = torch.tensor([], device=device)
