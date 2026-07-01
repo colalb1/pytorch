@@ -383,6 +383,8 @@ static void matrix_sqrt_sylv_small(const scalar_t* A, int64_t si, const scalar_t
 template <typename scalar_t, typename value_t>
 static void matrix_sqrt_quasitri(const scalar_t* T, scalar_t* U, int64_t m, int64_t ld, value_t nrm) {
   std::vector<int64_t> bs;
+  bs.reserve(m + 1);
+  
   for (int64_t p = 0; p < m;) {
     bs.push_back(p);
 
@@ -466,6 +468,7 @@ static void matrix_sqrt_tri_sqrt(scalar_t* T, scalar_t* U, int64_t n) {
   }
 
   std::vector<int64_t> bb;
+  bb.reserve(n + 1);
 
   for (int64_t p = 0; p < n;) {
     bb.push_back(p);
