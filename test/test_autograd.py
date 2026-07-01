@@ -14083,6 +14083,51 @@ class TestAutogradDeviceType(TestCase):
         self.assertEqual(model.a.grad.device, torch.device("cpu"))
         self.assertEqual(model.b.grad.device, torch.device("cpu"))
 
+    @dtypes(torch.double)
+    def test_cdist_gradgrad(self, device, dtype):
+        # Second-order (double) backward for cdist / _cdist_backward. p < 1 is
+        # excluded here because |diff|^(p-2) makes the second derivative too
+        # singular for a reliable finite-difference gradgradcheck.
+        make = partial(make_tensor, device=device, dtype=dtype, requires_grad=True)
+        shape_pairs = [
+            ((4, 3), (5, 3)),  # unbatched
+            ((2, 4, 3), (2, 5, 3)),  # batched
+            ((1, 4, 3), (2, 5, 3)),  # broadcast batch
+        ]
+        for p in [1.0, 1.5, 2.0, 2.5, 3.0, float("inf")]:
+            # p == 2 dispatches to _euclidean_dist (mm) or the fused kernel
+            # depending on compute_mode; exercise both backward paths.
+            modes = (
+                ["use_mm_for_euclid_dist", "donot_use_mm_for_euclid_dist"]
+                if p == 2.0
+                else ["donot_use_mm_for_euclid_dist"]
+            )
+            for s1, s2 in shape_pairs:
+                for mode in modes:
+                    x1, x2 = make(s1), make(s2)
+
+                    def fn(a, b, p=p, mode=mode):
+                        return torch.cdist(a, b, p, compute_mode=mode)
+
+                    with self.subTest(p=p, shapes=(s1, s2), mode=mode):
+                        self.assertTrue(gradcheck(fn, (x1, x2)))
+                        self.assertTrue(gradgradcheck(fn, (x1, x2)))
+
+    @dtypes(torch.double)
+    def test_pdist_gradgrad(self, device, dtype):
+        # Second-order (double) backward for pdist / _pdist_backward.
+        make = partial(make_tensor, device=device, dtype=dtype, requires_grad=True)
+        for p in [1.0, 1.5, 2.0, 2.5, 3.0, float("inf")]:
+            for shape in [(4, 3), (5, 2)]:
+                x = make(shape)
+
+                def fn(a, p=p):
+                    return torch.nn.functional.pdist(a, p)
+
+                with self.subTest(p=p, shape=shape):
+                    self.assertTrue(gradcheck(fn, (x,)))
+                    self.assertTrue(gradgradcheck(fn, (x,)))
+
 
 class TestAllowMutationOnSaved(TestCase):
     def assertClonedLenEqual(self, ctx, n):
