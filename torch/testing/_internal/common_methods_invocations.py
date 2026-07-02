@@ -21417,8 +21417,7 @@ op_db: list[OpInfo] = [
     OpInfo('histogram',
            dtypes=floating_types(),
            # int bin counts go through outer-edge selection, which (matching the
-           # CPU kernel) only dispatches float/double; half/bfloat16 are exercised
-           # with explicit ranges/edges in test_reductions.py.
+           # CPU kernel) only dispatches float/double
            dtypesIfCUDA=floating_types(),
            sample_inputs_func=sample_inputs_histogram,
            supports_autograd=False,
