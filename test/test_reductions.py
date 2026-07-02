@@ -3427,9 +3427,7 @@ class TestReductions(TestCase):
         eq_func(hist_out, expected_hist)
         eq_func(bin_edges_out, expected_bin_edges)
 
-    # CPU and CUDA only: the MPS/XPU histogram backends have preexisting quirks
-    # (e.g. different unsupported-dtype messages and numeric differences) that
-    # are out of scope here.
+
     @skipMeta
     @skipMPS
     @skipXPU
