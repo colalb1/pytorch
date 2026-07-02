@@ -3701,11 +3701,7 @@ as the input tensor excluding its innermost dimension'):
         eq_func(actual[0].cpu(), expected[0], equal_nan=True)
         eq_func(actual[1].cpu(), expected[1], equal_nan=True)
 
-    # The binning of the CUDA kernels is bit-for-bit identical to the CPU kernels;
-    # only the (atomic) accumulation order differs, which is exact for integer
-    # counts. half/bfloat16 are exercised here through explicit bin edges (whose
-    # values are shared across devices) and integer-valued weights so that the
-    # low-precision accumulation stays order-independent.
+
     @onlyCUDA
     @dtypes(torch.float32, torch.float64, torch.float16, torch.bfloat16)
     def test_histogram_cuda_consistency(self, device, dtype):
