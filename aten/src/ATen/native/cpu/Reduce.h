@@ -283,8 +283,9 @@ void binary_kernel_reduce_vec(TensorIteratorBase& iter, func_t op, vec_func_t vo
 // and input has contiguous most inner dimension, `binary_kernel_reduce_lastdim`
 // can be used.
 inline bool is_reduce_lastdim(TensorIteratorBase& iter) {
+  const int in{iter.noutputs()};  // the single input follows the outputs
   return iter.num_reduce_dims() == 1 && iter.is_dim_reduced(0)
-      && iter.ninputs() == 1 && iter.strides(1)[0] == iter.element_size(1);
+      && iter.ninputs() == 1 && iter.strides(in)[0] == iter.element_size(in);
 }
 
 template <typename reduce_func_t>
