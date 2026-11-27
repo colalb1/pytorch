@@ -15,6 +15,7 @@
 #include <ATen/native/cpu/Reduce.h>
 #include <ATen/native/cpu/LogAddExp.h>
 #include <ATen/native/cpu/SumKernel.h>
+#include <ATen/native/cpu/moments_utils.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -137,8 +138,45 @@ void logcumsumexp_cpu_kernel(Tensor& result, const Tensor& self, int64_t dim) {
   });
 }
 
+// Each output reduces one contiguous row, which RowwiseMeanM2 takes whole.
+// acc_type keeps float input in double, the precision WelfordOps has always used here.
+template <typename scalar_t>
+void std_var_lastdim_kernel(TensorIteratorBase& iter, double correction, bool take_sqrt) {
+  using acc_t = at::acc_type<scalar_t, /*is_cuda=*/false>;
+  const int64_t N{iter.shape()[0]};
+  const double nf{static_cast<double>(N)};
+  const double divisor{nf > correction ? nf - correction : 0};  // as in WelfordOps::project
+  const int ntensors{iter.ntensors()};
+  const int in{iter.noutputs()};
+  const bool has_mean{iter.noutputs() == 2};
+
+  TensorIterator sub_iter(iter);
+  sub_iter.narrow(0, 0, 1);  // one element per output; the row is read through iter's dim 0
+  const int64_t grain_size{std::max<int64_t>(1, at::internal::GRAIN_SIZE / N)};
+
+  sub_iter.for_each([&](char** data, const int64_t* strides, int64_t /*size0 == 1*/, int64_t size1) {
+    for (const auto j : c10::irange(size1)) {
+      const auto* x{reinterpret_cast<const scalar_t*>(data[in] + j * strides[ntensors + in])};
+      const auto [mean, m2]{RowwiseMeanM2<scalar_t, acc_t>(x, N)};
+      const double var{static_cast<double>(m2) / divisor};
+
+      *reinterpret_cast<scalar_t*>(data[0] + j * strides[ntensors]) =
+          static_cast<scalar_t>(take_sqrt ? std::sqrt(var) : var);
+      if (has_mean) {
+        *reinterpret_cast<scalar_t*>(data[1] + j * strides[ntensors + 1]) = static_cast<scalar_t>(mean);
+      }
+    }
+  }, grain_size);
+}
+
 void std_var_kernel_impl(TensorIterator& iter, double correction, bool take_sqrt) {
   AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, iter.dtype(), "std_cpu", [&] {
+    // One output element is the all-reduce, which binary_kernel_reduce splits across threads.
+    if (iter.num_output_elements() > 1 && is_reduce_lastdim(iter)) {
+      std_var_lastdim_kernel<scalar_t>(iter, correction, take_sqrt);
+      return;
+    }
+
     binary_kernel_reduce(
         iter,
         WelfordOps<
