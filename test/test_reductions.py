@@ -3341,6 +3341,176 @@ class TestReductionsDevice(TestCase):
         for f in [torch.std, torch.var, torch.var_mean, torch.std_mean]:
             _assert_warning(f, tensor, correction)
 
+    # The *_lastdim tests cover CPU var/std over a dim that is contiguous in memory, with more
+    # than one output. Rows are summed in vector steps of 8 floats, 4 doubles or 16
+    # bfloat16/half, chunks of 16 steps, then a cascade; these sizes cover tail-only rows,
+    # exact steps, chunk boundaries and cascade depth >= 4.
+    _LASTDIM_SIZES = (2, 3, 5, 7, 8, 9, 15, 16, 17, 31, 33, 64, 127, 128, 129, 383, 385, 1153, 4097, 2**17 + 3)
+
+    @staticmethod
+    def _fsum_mean_m2(x):
+        # Per-row mean and sum of squared deviations, from correctly rounded float64 sums.
+        means, m2s = [], []
+        for row in x.double().tolist():
+            mean = math.fsum(row) / len(row)
+            means.append(mean)
+            m2s.append(math.fsum((v - mean) ** 2 for v in row))
+        return torch.tensor(means, dtype=torch.double), torch.tensor(m2s, dtype=torch.double)
+
+    @onlyCPU
+    @dtypes(torch.float, torch.double, torch.bfloat16, torch.half)
+    @parametrize("op", ["var", "std", "var_mean", "std_mean"])
+    def test_var_std_lastdim_matches_float64(self, device, dtype, op):
+        fn = getattr(torch, op)
+        # 0.5 ulp of output rounding; accumulation error (in double, or float for bfloat16/half)
+        # is far below the other 0.5 ulp.
+        rtol = 1e-13 if dtype == torch.double else torch.finfo(dtype).eps
+        acc_eps = torch.finfo(torch.float if dtype in (torch.bfloat16, torch.half) else torch.double).eps
+        gen = torch.Generator(device=device).manual_seed(0)
+        for n in self._LASTDIM_SIZES:
+            x = torch.randn(3, n, generator=gen, dtype=torch.double, device=device).to(dtype)
+            ref_mean, ref_m2 = self._fsum_mean_m2(x)
+            mean_atol = 2 * math.log2(n) * acc_eps * x.abs().max().item()
+            for correction in (0, 1, 2.5):
+                if n <= correction:
+                    continue
+                res = fn(x, dim=-1, correction=correction)
+                ref = ref_m2 / (n - correction)
+                ref = ref.sqrt() if op.startswith("std") else ref
+                msg = f"n={n} correction={correction}"
+                if op.endswith("_mean"):
+                    self.assertEqual(res[1].double(), ref_mean, rtol=rtol, atol=mean_atol, msg=msg)
+                    res = res[0]
+                self.assertEqual(res.double(), ref, rtol=rtol, atol=0, msg=msg)
+
+    # Each case fails with float accumulators: (a) loses ~1e-4 relative, (b) overflows
+    # m2 = 2**132 and (c) underflows the squares 2**-280.
+    @onlyCPU
+    @dtypes(torch.float)
+    def test_var_std_lastdim_float_keeps_double_accumulation(self, device, dtype):
+        gen = torch.Generator(device=device).manual_seed(0)
+        x = (1e4 + torch.randn(4, 4096, generator=gen, dtype=torch.double, device=device)).to(dtype)
+        _, ref_m2 = self._fsum_mean_m2(x)
+        self.assertEqual(x.var(-1, correction=0).double(), ref_m2 / 4096, rtol=torch.finfo(dtype).eps, atol=0)
+
+        big = torch.tensor([2.0**63, -(2.0**63)], dtype=dtype, device=device).repeat(2, 32)
+        self.assertEqual(big.var(-1, correction=0), torch.full((2,), 2.0**126, dtype=dtype, device=device), atol=0, rtol=0)
+
+        tiny = torch.tensor([2.0**-140, -(2.0**-140)], dtype=dtype, device=device).repeat(2, 32)
+        self.assertEqual(tiny.std(-1, correction=0), torch.full((2,), 2.0**-140, dtype=dtype, device=device), atol=0, rtol=0)
+
+    @onlyCPU
+    @dtypes(torch.float, torch.double, torch.bfloat16)
+    def test_var_mean_lastdim_nonfinite(self, device, dtype):
+        step = {torch.float: 8, torch.double: 4, torch.bfloat16: 16}[dtype]
+        specials = (math.inf, -math.inf, math.nan)
+        gen = torch.Generator(device=device).manual_seed(0)
+
+        def rows_with_specials(n, positions):
+            x = torch.randn(len(specials) * len(positions) + 1, n, generator=gen, dtype=torch.double, device=device)
+            for i, (s, p) in enumerate(product(specials, positions)):
+                x[i, p] = s
+            return x.to(dtype)
+
+        # A non-finite value in the vector body (index 1) or in the scalar tail (last index).
+        # The mean is not checked: with an infinity it depends on where the infinity lands.
+        n = 2 * step + 3
+        x = rows_with_specials(n, (1, n - 1))
+        for fn in (torch.var, torch.std):
+            res = fn(x, dim=-1)
+            self.assertTrue(res[:-1].isnan().all(), msg=f"{fn.__name__}: {res}")
+            self.assertTrue(res[-1].isfinite())
+
+        # Rows shorter than one step must match WelfordOps (SharedReduceOps.h) exactly in their
+        # non-finite results, e.g. [1, 2, inf] has mean inf, not NaN.
+        def welford(row):
+            mean, m2 = 0.0, 0.0
+            for i, v in enumerate(row, 1):
+                delta = v - mean
+                mean += delta / i
+                m2 += delta * (v - mean)
+            return m2 / (len(row) - 1), mean
+
+        acc_eps = torch.finfo(torch.float if dtype == torch.bfloat16 else torch.double).eps
+        for n in range(2, step):
+            x = rows_with_specials(n, range(n))
+            ref_var, ref_mean = (torch.tensor(r, dtype=torch.double) for r in zip(*map(welford, x.double().tolist())))
+            var, mean = torch.var_mean(x, dim=-1)
+            # Finite rows: 1 ulp, plus n steps of accumulation error.
+            max_abs = x[-1].abs().max().item()
+            atol = n * acc_eps * max_abs
+            self.assertEqual(mean.double(), ref_mean, rtol=torch.finfo(dtype).eps, atol=atol, msg=f"n={n}")
+            self.assertEqual(var.double(), ref_var, rtol=torch.finfo(dtype).eps, atol=atol * max_abs, msg=f"n={n}")
+
+            # delta * delta overflows in the accumulator type for double and bfloat16, so merging
+            # an empty vector lane in would give NaN.
+            big = torch.full((2, n), torch.finfo(dtype).max / 2, dtype=dtype, device=device)
+            var, mean = torch.var_mean(big, dim=-1)
+            self.assertEqual(var, torch.zeros(2, dtype=dtype, device=device), atol=0, rtol=0, msg=f"n={n}")
+            self.assertEqual(mean, big[:, 0], atol=0, rtol=0, msg=f"n={n}")
+
+    @onlyCPU
+    @dtypes(torch.float, torch.double)
+    def test_var_std_lastdim_correction(self, device, dtype):
+        x = make_tensor((4, 33), dtype=dtype, device=device)
+        array = x.double().cpu().numpy()
+        for correction, name in product((0, 1, 2.5, 32, 33, 40, -1), ("var", "std")):
+            ref = torch.from_numpy(np.asarray(getattr(np, name)(array, axis=-1, ddof=correction))).to(dtype)
+            res = getattr(torch, name)(x, dim=-1, correction=correction)
+            # inf vs. nan results are sensitive to machine precision, as in test_var_correction_vs_numpy
+            ref[ref.isinf()] = nan
+            res[res.isinf()] = nan
+            self.assertEqual(res, ref, msg=f"{name} correction={correction}")
+
+        # N <= correction divides by 0: 0 / 0 for a constant row, positive / 0 otherwise.
+        rows = torch.stack([torch.full((33,), 1.5, dtype=dtype, device=device), torch.arange(33, dtype=dtype, device=device)])
+        expected = torch.tensor([nan, inf], dtype=dtype, device=device)
+        for correction in (33, 40):
+            self.assertEqual(torch.var(rows, dim=-1, correction=correction), expected)
+            self.assertEqual(torch.std(rows, dim=-1, correction=correction), expected)
+
+    # Every layout reduces the same contiguous rows, so results are bit-identical.
+    @onlyCPU
+    @dtypes(torch.float, torch.bfloat16)
+    def test_var_std_lastdim_layouts(self, device, dtype):
+        def check(a, b):
+            self.assertEqual(a, b, atol=0, rtol=0)
+
+        x = make_tensor((12, 100), dtype=dtype, device=device)
+        check(x[::2].var(-1), x[::2].contiguous().var(-1))
+        check(x.t().var(0), x.var(1))
+
+        cl = make_tensor((2, 37, 3, 5), dtype=dtype, device=device).contiguous(memory_format=torch.channels_last)
+        check(cl.var(1), cl.permute(0, 2, 3, 1).contiguous().var(-1))
+
+        y = make_tensor((4, 5, 21), dtype=dtype, device=device)
+        check(y.var(dim=(1, 2)), y.reshape(4, 105).var(-1))
+
+        check(x.var(-1, keepdim=True).squeeze(-1), x.var(-1))
+
+        out = torch.empty(24, dtype=dtype, device=device)[::2]
+        torch.var(x, -1, out=out)
+        check(out, x.var(-1))
+
+        check(torch.var_mean(x, -1)[0], x.var(-1))
+        check(torch.std_mean(x, -1)[0], x.std(-1))
+
+    # Rows are never split across threads. GRAIN_SIZE / N gives 512 rows per task at N = 64
+    # and 7 at N = 4097, so both shapes run on several threads.
+    @onlyCPU
+    @dtypes(torch.float, torch.bfloat16)
+    def test_var_std_lastdim_thread_invariance(self, device, dtype):
+        num_threads = torch.get_num_threads()
+        try:
+            for shape in ((4096, 64), (64, 4097)):
+                x = make_tensor(shape, dtype=dtype, device=device)
+                torch.set_num_threads(1)
+                expected = torch.var_mean(x, -1)
+                torch.set_num_threads(4)
+                self.assertEqual(torch.var_mean(x, -1), expected, atol=0, rtol=0, msg=f"shape={shape}")
+        finally:
+            torch.set_num_threads(num_threads)
+
     def test_amin_amax_some_dims(self, device):
         sizes = (4, 6, 7, 5, 3)
         dims = len(sizes)
