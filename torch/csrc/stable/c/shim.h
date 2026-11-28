@@ -386,6 +386,70 @@ AOTI_TORCH_EXPORT AOTITorchError torch_device_to_pyobject(
  */
 #if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
 
+// Read the layout out of a Python torch.layout object. The returned code uses
+// the same encoding as aoti_torch_layout_*().
+AOTI_TORCH_EXPORT AOTITorchError
+torch_layout_from_pyobject(void* py_obj, int32_t* ret_layout);
+
+// Wrap a layout code (aoti_torch_layout_*() encoding) as a Python torch.layout.
+AOTI_TORCH_EXPORT AOTITorchError torch_layout_to_pyobject(
+    int32_t layout,
+    void** ret); // returns new reference
+
+// Read the memory format out of a Python torch.memory_format object. The
+// returned code uses the same encoding as aoti_torch_memory_format_*().
+AOTI_TORCH_EXPORT AOTITorchError
+torch_memory_format_from_pyobject(void* py_obj, int32_t* ret_memory_format);
+
+// Wrap a memory format code (aoti_torch_memory_format_*() encoding) as a Python
+// torch.memory_format.
+AOTI_TORCH_EXPORT AOTITorchError torch_memory_format_to_pyobject(
+    int32_t memory_format,
+    void** ret); // returns new reference
+
+// Read a Python bool. Only True and False are accepted.
+AOTI_TORCH_EXPORT AOTITorchError
+torch_bool_from_pyobject(void* py_obj, bool* ret);
+
+// Wrap a bool as a Python bool.
+AOTI_TORCH_EXPORT AOTITorchError torch_bool_to_pyobject(
+    bool value,
+    void** ret); // returns new reference
+
+// Read a Python int (not bool) as an int64_t; errors if it is out of range.
+AOTI_TORCH_EXPORT AOTITorchError
+torch_int64_from_pyobject(void* py_obj, int64_t* ret);
+
+// Wrap an int64_t as a Python int.
+AOTI_TORCH_EXPORT AOTITorchError torch_int64_to_pyobject(
+    int64_t value,
+    void** ret); // returns new reference
+
+// Read a Python float or int as a double.
+AOTI_TORCH_EXPORT AOTITorchError
+torch_double_from_pyobject(void* py_obj, double* ret);
+
+// Wrap a double as a Python float.
+AOTI_TORCH_EXPORT AOTITorchError torch_double_to_pyobject(
+    double value,
+    void** ret); // returns new reference
+
+// Copy a Python str (encoded as UTF-8) or bytes (as is) into a new
+// StringHandle, which the caller frees with torch_delete_string. Embedded NUL
+// bytes are preserved.
+AOTI_TORCH_EXPORT AOTITorchError torch_string_from_pyobject(
+    void* py_obj,
+    StringHandle* ret); // returns new reference
+
+// Decode data[0, length) as strict UTF-8 into an owned Python str, preserving
+// embedded NUL bytes. data is borrowed only for the call; it may be nullptr
+// when length is 0, but must be non-null otherwise. The output is a new Python
+// reference which the caller releases or transfers; invalid UTF-8 errors.
+AOTI_TORCH_EXPORT AOTITorchError torch_string_to_pyobject(
+    const char* data,
+    size_t length,
+    void** ret); // returns new reference
+
 // Reads an integer from at::cpu::get_cpu_capabilities().
 // Key is borrowed and NUL-terminated. Outputs are caller-owned.
 // A miss sets *ret_key_exists to false and leaves *ret_value unchanged.
